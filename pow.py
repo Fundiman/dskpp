@@ -110,7 +110,7 @@ class DeepSeekHash:
 
 class DeepSeekPOW:
     def __init__(self):
-        self.hasher = DeepSeekHash().init(WASM_PATH)
+        pass
 
     async def solve_challenge(self, config: Dict[str, Any]) -> str:
         """
@@ -119,7 +119,8 @@ class DeepSeekPOW:
         """
 
         def _solve():
-            answer = self.hasher.calculate_hash(
+            hasher = DeepSeekHash().init(WASM_PATH)
+            answer = hasher.calculate_hash(
                 config['algorithm'],
                 config['challenge'],
                 config['salt'],
