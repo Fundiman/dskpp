@@ -21,7 +21,7 @@ This project follows the same conceptual direction (and also contains elements f
 
 ## overview
 
-dskpp provides:
+dsk++ provides:
 
 * async DeepSeek chat client
 * streaming response support with dual format parsing
