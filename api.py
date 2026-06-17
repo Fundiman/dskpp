@@ -288,14 +288,81 @@ class DeepSeekAPI:
                     raise APIError(text, response.status_code)
                 
                 result = json.loads(text)
-                return result['data']['biz_data']['id']
-                    
+
+                if result['data'] is not None:
+                    file_id = result['data']['biz_data']['id']
+                    # We wait for the file to be ready with a timeout of 60 seconds, polling every 2 seconds.
+                    ready_file_id = await self._wait_for_file_ready(file_id, timeout=60.0, poll_interval=2.0)
+                    return ready_file_id
+
             except Exception as e:
                 if retry_count >= max_retries - 1:
                     raise NetworkError(f"Failed to upload {file_path}: {str(e)}")
                 retry_count += 1
         
         raise APIError(f"Failed to upload {file_path} after retries")
+
+    async def _wait_for_file_ready(self, file_id: str, timeout: float = 60.0, poll_interval: float = 2.0) -> str:
+        """
+        Wait until uploaded file is successfully processed.
+        Returns file_id on success, empty string on failure/timeout.
+        """
+        start = asyncio.get_event_loop().time()
+        last_error = None
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed > timeout:
+                print(f"\033[93mTimeout waiting for file {file_id} to be ready\033[0m", file=sys.stderr)
+                return ''
+
+            try:
+                url = f"{self.BASE_URL}/file/fetch_files?file_ids={file_id}"
+                challenge = await self._get_pow_challenge()
+                pow_response = await self.pow_solver.solve_challenge(challenge)
+                headers = self._get_headers(pow_response)
+
+                res = await self.session.get(
+                    url,
+                    headers=headers,
+                    cookies=self.cookies,
+                    impersonate='chrome120'
+                )
+                text = res.text
+                if "<!DOCTYPE html>" in text and "Just a moment" in text:
+                    print("Cloudflare while polling file status", file=sys.stderr)
+                    await self._refresh_cookies()
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                result = json.loads(text)
+
+                # Check file ready status
+                if result.get('data') and result['data'].get('biz_data'):
+                    files = result['data']['biz_data'].get('files', [])
+                    if files:
+                        status = files[0].get('status')
+                        if status == "SUCCESS":
+                            return file_id
+                        elif status == "PARSING":
+                            await asyncio.sleep(poll_interval)
+                            continue
+                        else:
+                            print(f"File {file_id} ended with unexpected status: {status}", file=sys.stderr)
+                            return ''
+                else:
+                    print(f"Unexpected API response while polling file {file_id}", file=sys.stderr)
+                    return ''
+
+            except json.JSONDecodeError as e:
+                last_error = f"JSON decode error: {e}"
+            except Exception as e:
+                last_error = str(e)
+
+            # Pause before retrying after an error
+            print(f"\033[93mError polling file {file_id} (will retry): {last_error}\033[0m", file=sys.stderr)
+            await asyncio.sleep(poll_interval)
+
 
     async def upload_files(self, file_paths: List[str]) -> List[str]:
         """
@@ -309,9 +376,11 @@ class DeepSeekAPI:
         """
         # Create tasks for concurrent uploads
         tasks = [self._upload_single_file(file_path) for file_path in file_paths]
-        
+
         # Run all uploads concurrently
         file_ids = await asyncio.gather(*tasks)
+
+        file_ids = [res for res in file_ids if res != '']
         
         return file_ids
 
@@ -353,6 +422,9 @@ class DeepSeekAPI:
             'ref_file_ids': ref_file_ids if ref_file_ids else [],
             'thinking_enabled': thinking_enabled,
             'search_enabled': search_enabled,
+            'model_type': None,
+            'preempt': False,
+            'action': None
         }
 
         # Get challenge and solve it
