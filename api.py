@@ -402,6 +402,41 @@ class DeepSeekAPI:
                     if parsed.get('finish_reason') == 'stop':
                         break
 
+    async def stop_stream(
+        self,
+        chat_session_id: str,
+        message_id: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Stop an active stream generation for a message
+
+        Args:
+            chat_session_id (str): The ID of the chat session
+            message_id (Optional[int]): The response message ID to stop.
+                If not provided, uses the last known response_message_id 
+                tracked from the most recent chat_completion call.
+
+        Returns:
+            Dict[str, Any]: The API response, e.g.:
+            {"code": 0, "msg": "", "data": {"biz_code": 0, "biz_msg": "", "biz_data": None}}
+        """
+        if message_id is None:
+            message_id = self.last_message_id.get(chat_session_id)
+
+        if message_id is None:
+            raise ValueError(
+                "message_id is required when no active stream is tracked for this session"
+            )
+
+        return await self._make_request(
+            'POST',
+            '/chat/stop_stream',
+            {
+                'chat_session_id': chat_session_id,
+                'message_id': message_id,
+            }
+        )
+
     async def get_history(self, convo_id: str) -> Dict[str, Any]:
         """Fetch full conversation history"""
         url = f"{self.BASE_URL}/chat/history_messages?chat_session_id={convo_id}"

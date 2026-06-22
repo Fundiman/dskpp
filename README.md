@@ -229,6 +229,30 @@ print(history)
 
 ---
 
+### stop stream generation
+
+Stop an active response mid-generation. The `message_id` is automatically tracked from the last `chat_completion` call:
+
+```python
+response = await api.stop_stream(chat_session_id=session_id)
+print(response)
+# {"code": 0, "msg": "", "data": {"biz_code": 0, "biz_msg": "", "biz_data": None}}
+```
+
+A specific `message_id` can also be passed directly:
+
+```python
+response = await api.stop_stream(
+    chat_session_id=session_id,
+    message_id=2  # response message ID
+)
+```
+
+> [!NOTE]
+> After `chat_completion` yields a chunk with `type: 'message_ids'`, its `response_message_id` is automatically stored and used by `stop_stream` when no `message_id` is given.
+
+---
+
 ### cleanup
 
 > [!IMPORTANT]
