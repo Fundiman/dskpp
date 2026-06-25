@@ -50,6 +50,9 @@ class APIError(DeepSeekError):
 
 class DeepSeekAPI:
     BASE_URL = "https://chat.deepseek.com/api/v0"
+    MODEL_TYPE = 'default' # 'default' — supports files (only text data, images, and documents)
+                           # 'expert'  — does not support files (only prompts)
+                           # 'vision'  — supports files (any images and documents)
 
     def __init__(self, auth_token: str):
         if not auth_token or not isinstance(auth_token, str):
@@ -88,7 +91,7 @@ class DeepSeekAPI:
             'x-app-version': '20241129.1',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '1.0.0-always',
+            'x-client-version': '2.0.0',
         }
 
         if pow_response:
@@ -211,7 +214,7 @@ class DeepSeekAPI:
                 '/chat_session/create',
                 {'character_id': None}
             )
-            return response['data']['biz_data']['id']
+            return response['data']['biz_data']['chat_session']['id']
         except KeyError:
             raise APIError("Invalid session creation response format from server")
 
@@ -230,7 +233,6 @@ class DeepSeekAPI:
     async def _upload_single_file(self, file_path: str) -> str:
         """Upload a single file and return its ID"""
         url = f"{self.BASE_URL}/file/upload_file"
-        
         # Get challenge and solve it
         challenge = await self._get_pow_challenge_for_upload()
         pow_response = await self.pow_solver.solve_challenge(challenge)
@@ -243,11 +245,12 @@ class DeepSeekAPI:
             'origin': 'https://chat.deepseek.com',
             'referer': 'https://chat.deepseek.com/',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-            'x-app-version': '20241129.1',
+            'x-app-version': '2.0.0',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '1.0.0-always',
+            'x-client-version': '2.0.0',
             'x-ds-pow-response': pow_response,
+            'x-model-type': self.MODEL_TYPE
         }
         
         retry_count = 0
@@ -422,7 +425,7 @@ class DeepSeekAPI:
             'ref_file_ids': ref_file_ids if ref_file_ids else [],
             'thinking_enabled': thinking_enabled,
             'search_enabled': search_enabled,
-            'model_type': None,
+            'model_type': self.MODEL_TYPE,
             'preempt': False,
             'action': None
         }
