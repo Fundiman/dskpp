@@ -515,38 +515,59 @@ class DeepSeekAPI:
             else:
                 # Skip non-data lines (like event: lines)
                 return None
-            
+
             # Skip empty data
             if not data_str or not data_str.strip():
                 return None
-            
+
             # Parse JSON
             data = json.loads(data_str)
-            
+
+            # Handle nested response format (first message with full structure)
+            if 'v' in data and isinstance(data['v'], dict) and 'response' in data['v']:
+                response_data = data['v']['response']
+                fragments = response_data.get('fragments', [])
+
+                # Extract text from RESPONSE type fragments
+                for fragment in fragments:
+                    if fragment.get('type') == 'RESPONSE' and fragment.get('content'):
+                        content = fragment['content']
+                        if isinstance(content, str) and content.strip():
+                            return {
+                                'type': 'text',
+                                'content': content,
+                                'finish_reason': None
+                            }
+
+                # Check for message IDs in the response structure
+                if 'message_id' in response_data:
+                    return {
+                        'type': 'message_ids',
+                        'response_message_id': response_data['message_id'],
+                        'finish_reason': None,
+                        'content': ''
+                    }
+
             # Handle chunks with just 'v' field (simplified format)
-            if 'v' in data and 'p' not in data:
+            if 'v' in data and 'p' not in data and not isinstance(data['v'], dict):
                 v_value = data.get('v', '')
-                # Ensure v_value is a string
-                if isinstance(v_value, dict):
-                    # If it's a dict, convert to string or skip
-                    return None
                 return {
                     'type': 'text',
-                    'content': str(v_value),  # Force to string
+                    'content': str(v_value),
                     'finish_reason': None
                 }
-            
+
             # Handle full DeepSeek format with 'p' and 'v' fields
-            if 'v' in data and data.get('p') == 'response/content' and data.get('o') == 'APPEND':
+            if 'v' in data and data.get('p') == 'response/fragments/-1/content' and data.get('o') == 'APPEND':
                 v_value = data.get('v', '')
                 if isinstance(v_value, dict):
                     return None
                 return {
                     'type': 'text',
-                    'content': str(v_value),  # Force to string
+                    'content': str(v_value),
                     'finish_reason': None
                 }
-            
+
             # Handle finished status
             if data.get('p') == 'response/status' and data.get('v') == 'FINISHED':
                 return {
@@ -554,7 +575,7 @@ class DeepSeekAPI:
                     'content': '',
                     'finish_reason': 'stop'
                 }
-            
+
             # Handle message IDs (first message)
             if 'request_message_id' in data and 'response_message_id' in data:
                 return {
@@ -563,15 +584,16 @@ class DeepSeekAPI:
                     'finish_reason': None,
                     'content': ''
                 }
-            
+
             # Skip other message types
             return None
-            
+
         except json.JSONDecodeError:
             return None
         except Exception as e:
             print(f"Warning: Error parsing chunk: {e}", file=sys.stderr)
             return None
+            
     async def close(self):
         """Close the async session"""
         await self.session.close()
