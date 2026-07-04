@@ -60,6 +60,9 @@ pip install -r requirements.txt
 * xvfb (for headless fallback)
 * python 3.10+
 
+> [!TIP]
+> Chrome and xvfb are only used for Cloudflare clearance during cookie generation. In normal usage you acquire cookies once and they last for days — you'll only need these if you're spamming requests aggressively enough to trigger Cloudflare challenges.
+
 ---
 
 ## quick start
