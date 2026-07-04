@@ -50,6 +50,9 @@ class APIError(DeepSeekError):
 
 class DeepSeekAPI:
     BASE_URL = "https://chat.deepseek.com/api/v0"
+    MODEL_TYPE = 'default' # 'default' — supports files (only text data, images, and documents)
+                           # 'expert'  — does not support files (only prompts)
+                           # 'vision'  — supports files (any images and documents)
 
     def __init__(self, auth_token: str):
         if not auth_token or not isinstance(auth_token, str):
@@ -88,7 +91,7 @@ class DeepSeekAPI:
             'x-app-version': '20241129.1',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '1.0.0-always',
+            'x-client-version': '2.0.0',
         }
 
         if pow_response:
@@ -239,7 +242,6 @@ class DeepSeekAPI:
     async def _upload_single_file(self, file_path: str) -> str:
         """Upload a single file and return its ID"""
         url = f"{self.BASE_URL}/file/upload_file"
-        
         # Get challenge and solve it
         challenge = await self._get_pow_challenge_for_upload()
         pow_response = await self.pow_solver.solve_challenge(challenge)
@@ -252,11 +254,12 @@ class DeepSeekAPI:
             'origin': 'https://chat.deepseek.com',
             'referer': 'https://chat.deepseek.com/',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-            'x-app-version': '20241129.1',
+            'x-app-version': '2.0.0',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '1.0.0-always',
+            'x-client-version': '2.0.0',
             'x-ds-pow-response': pow_response,
+            'x-model-type': self.MODEL_TYPE
         }
         
         retry_count = 0
@@ -297,17 +300,81 @@ class DeepSeekAPI:
                     raise APIError(text, response.status_code)
                 
                 result = json.loads(text)
-                biz_data = result['data']['biz_data']
-                if biz_data is None:
-                    raise APIError(f"Empty biz_data in upload response: {result.get('msg', '')}")
-                return biz_data['id']
-                    
+
+                if result['data'] is not None:
+                    file_id = result['data']['biz_data']['id']
+                    # We wait for the file to be ready with a timeout of 60 seconds, polling every 2 seconds.
+                    ready_file_id = await self._wait_for_file_ready(file_id, timeout=60.0, poll_interval=2.0)
+                    return ready_file_id
+
             except Exception as e:
                 if retry_count >= max_retries - 1:
                     raise NetworkError(f"Failed to upload {file_path}: {str(e)}")
                 retry_count += 1
         
         raise APIError(f"Failed to upload {file_path} after retries")
+
+    async def _wait_for_file_ready(self, file_id: str, timeout: float = 60.0, poll_interval: float = 2.0) -> str:
+        """
+        Wait until uploaded file is successfully processed.
+        Returns file_id on success, empty string on failure/timeout.
+        """
+        start = asyncio.get_event_loop().time()
+        last_error = None
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed > timeout:
+                print(f"\033[93mTimeout waiting for file {file_id} to be ready\033[0m", file=sys.stderr)
+                return ''
+
+            try:
+                url = f"{self.BASE_URL}/file/fetch_files?file_ids={file_id}"
+                challenge = await self._get_pow_challenge()
+                pow_response = await self.pow_solver.solve_challenge(challenge)
+                headers = self._get_headers(pow_response)
+
+                res = await self.session.get(
+                    url,
+                    headers=headers,
+                    cookies=self.cookies,
+                    impersonate='chrome120'
+                )
+                text = res.text
+                if "<!DOCTYPE html>" in text and "Just a moment" in text:
+                    print("Cloudflare while polling file status", file=sys.stderr)
+                    await self._refresh_cookies()
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                result = json.loads(text)
+
+                # Check file ready status
+                if result.get('data') and result['data'].get('biz_data'):
+                    files = result['data']['biz_data'].get('files', [])
+                    if files:
+                        status = files[0].get('status')
+                        if status == "SUCCESS":
+                            return file_id
+                        elif status == "PARSING":
+                            await asyncio.sleep(poll_interval)
+                            continue
+                        else:
+                            print(f"File {file_id} ended with unexpected status: {status}", file=sys.stderr)
+                            return ''
+                else:
+                    print(f"Unexpected API response while polling file {file_id}", file=sys.stderr)
+                    return ''
+
+            except json.JSONDecodeError as e:
+                last_error = f"JSON decode error: {e}"
+            except Exception as e:
+                last_error = str(e)
+
+            # Pause before retrying after an error
+            print(f"\033[93mError polling file {file_id} (will retry): {last_error}\033[0m", file=sys.stderr)
+            await asyncio.sleep(poll_interval)
+
 
     async def upload_files(self, file_paths: List[str]) -> List[str]:
         """
@@ -321,9 +388,11 @@ class DeepSeekAPI:
         """
         # Create tasks for concurrent uploads
         tasks = [self._upload_single_file(file_path) for file_path in file_paths]
-        
+
         # Run all uploads concurrently
         file_ids = await asyncio.gather(*tasks)
+
+        file_ids = [res for res in file_ids if res != '']
         
         return file_ids
 
@@ -365,6 +434,9 @@ class DeepSeekAPI:
             'ref_file_ids': ref_file_ids if ref_file_ids else [],
             'thinking_enabled': thinking_enabled,
             'search_enabled': search_enabled,
+            'model_type': self.MODEL_TYPE,
+            'preempt': False,
+            'action': None
         }
 
         # Get challenge and solve it
@@ -696,38 +768,59 @@ class DeepSeekAPI:
             else:
                 # Skip non-data lines (like event: lines)
                 return None
-            
+
             # Skip empty data
             if not data_str or not data_str.strip():
                 return None
-            
+
             # Parse JSON
             data = json.loads(data_str)
-            
+
+            # Handle nested response format (first message with full structure)
+            if 'v' in data and isinstance(data['v'], dict) and 'response' in data['v']:
+                response_data = data['v']['response']
+                fragments = response_data.get('fragments', [])
+
+                # Extract text from RESPONSE type fragments
+                for fragment in fragments:
+                    if fragment.get('type') == 'RESPONSE' and fragment.get('content'):
+                        content = fragment['content']
+                        if isinstance(content, str) and content.strip():
+                            return {
+                                'type': 'text',
+                                'content': content,
+                                'finish_reason': None
+                            }
+
+                # Check for message IDs in the response structure
+                if 'message_id' in response_data:
+                    return {
+                        'type': 'message_ids',
+                        'response_message_id': response_data['message_id'],
+                        'finish_reason': None,
+                        'content': ''
+                    }
+
             # Handle chunks with just 'v' field (simplified format)
-            if 'v' in data and 'p' not in data:
+            if 'v' in data and 'p' not in data and not isinstance(data['v'], dict):
                 v_value = data.get('v', '')
-                # Ensure v_value is a string
-                if isinstance(v_value, dict):
-                    # If it's a dict, convert to string or skip
-                    return None
                 return {
                     'type': 'text',
-                    'content': str(v_value),  # Force to string
+                    'content': str(v_value),
                     'finish_reason': None
                 }
-            
+
             # Handle full DeepSeek format with 'p' and 'v' fields
-            if 'v' in data and data.get('p') == 'response/content' and data.get('o') == 'APPEND':
+            if 'v' in data and data.get('p') == 'response/fragments/-1/content' and data.get('o') == 'APPEND':
                 v_value = data.get('v', '')
                 if isinstance(v_value, dict):
                     return None
                 return {
                     'type': 'text',
-                    'content': str(v_value),  # Force to string
+                    'content': str(v_value),
                     'finish_reason': None
                 }
-            
+
             # Handle finished status
             if data.get('p') == 'response/status' and data.get('v') == 'FINISHED':
                 return {
@@ -735,7 +828,7 @@ class DeepSeekAPI:
                     'content': '',
                     'finish_reason': 'stop'
                 }
-            
+
             # Handle message IDs (first message)
             if 'request_message_id' in data and 'response_message_id' in data:
                 return {
@@ -744,15 +837,16 @@ class DeepSeekAPI:
                     'finish_reason': None,
                     'content': ''
                 }
-            
+
             # Skip other message types
             return None
-            
+
         except json.JSONDecodeError:
             return None
         except Exception as e:
             print(f"Warning: Error parsing chunk: {e}", file=sys.stderr)
             return None
+            
     async def close(self):
         """Close the async session"""
         await self.session.close()
