@@ -390,9 +390,8 @@ class DeepSeekAPI:
                 elif response.status_code == 429:
                     raise RateLimitError("API rate limit exceeded")
                 else:
+                    print(f"\033[91msearch_query error {response.status_code}: {text[:500]}\033[0m", file=sys.stderr)
                     raise APIError(text, response.status_code)
-
-            self.last_message_id = {}
 
             async for line in response.aiter_lines():
                 # Decode bytes to string if needed
@@ -413,6 +412,80 @@ class DeepSeekAPI:
 
                     if parsed.get('finish_reason') == 'stop':
                         break
+
+    async def search_query(
+        self,
+        query: str,
+        before_seq_id: Optional[str] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        json_data = {
+            'query': query,
+            'before_seq_id': before_seq_id,
+        }
+
+        headers = self._get_headers()
+        headers['x-client-bundle-id'] = 'com.deepseek.chat'
+        headers['x-client-timezone-offset'] = '18000'
+
+        async with self.session.stream(
+            'POST',
+            f"{self.BASE_URL}/index/query",
+            headers=headers,
+            json=json_data,
+            cookies=self.cookies,
+            impersonate='chrome120',
+        ) as response:
+
+            if response.status_code != 200:
+                text = response.text
+                if response.status_code == 401:
+                    raise AuthenticationError("Invalid or expired authentication token")
+                elif response.status_code == 429:
+                    raise RateLimitError("API rate limit exceeded")
+                else:
+                    print(f"\033[91msearch_query error {response.status_code}: {text[:500]}\033[0m", file=sys.stderr)
+                    raise APIError(text, response.status_code)
+
+            async for line in response.aiter_lines():
+                if isinstance(line, bytes):
+                    line = line.decode('utf-8')
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                if line.startswith('event:'):
+                    continue
+
+                if not line.startswith('data:'):
+                    continue
+
+                data_str = line[5:].strip()
+                if not data_str:
+                    continue
+
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                text_parts = []
+                for part in data.get('content', {}).get('parts', []):
+                    part_text = part.get('text', '')
+                    if part_text:
+                        text_parts.append(part_text)
+
+                content = ''.join(text_parts)
+
+                yield {
+                    'type': 'text',
+                    'content': content,
+                    'message_id': data.get('message_id'),
+                    'seq_id': data.get('seq_id'),
+                    'is_begin': data.get('content', {}).get('is_begin', False),
+                    'is_end': data.get('content', {}).get('is_end', False),
+                    'is_think': data.get('is_think', False),
+                }
 
     async def continue_stream(
         self,
@@ -563,6 +636,28 @@ class DeepSeekAPI:
             }
         )
 
+    async def index_prepare(self) -> Dict[str, Any]:
+        url = f"{self.BASE_URL}/index/prepare"
+        headers = self._get_headers()
+
+        response = await self.session.get(
+            url,
+            headers=headers,
+            cookies=self.cookies,
+            impersonate='chrome120',
+        )
+
+        if response.status_code != 200:
+            text = response.text
+            if response.status_code == 401:
+                raise AuthenticationError("Invalid or expired authentication token")
+            elif response.status_code == 429:
+                raise RateLimitError("API rate limit exceeded")
+            else:
+                raise APIError(text, response.status_code)
+
+        return json.loads(response.text)
+
     async def get_history(self, convo_id: str) -> Dict[str, Any]:
         """Fetch full conversation history"""
         url = f"{self.BASE_URL}/chat/history_messages?chat_session_id={convo_id}"
@@ -573,19 +668,19 @@ class DeepSeekAPI:
         
         headers = self._get_headers(pow_response)
 
-        async with self.session.get(
+        response = await self.session.get(
             url,
             headers=headers,
             cookies=self.cookies
-        ) as response:
+        )
 
-            if response.status_code != 200:
-                return {
-                    "error": response.status_code,
-                    "detail": response.text
-                }
+        if response.status_code != 200:
+            return {
+                "error": response.status_code,
+                "detail": response.text
+            }
 
-            return json.loads(response.text)
+        return json.loads(response.text)
 
     def _parse_chunk_sync(self, chunk: str) -> Optional[Dict[str, Any]]:
         """Parse a SSE chunk from the API response (synchronous version)"""

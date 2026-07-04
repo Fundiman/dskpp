@@ -280,6 +280,30 @@ async for chunk in api.continue_stream(
 
 ---
 
+### index prepare (handshake)
+
+Initialize the session environment before making other calls. Can be parallelized with other startup tasks:
+
+```python
+# Run concurrently with session creation to hide latency
+prepare_task = asyncio.create_task(api.index_prepare())
+session_id = await api.create_chat_session()
+prepare_result = await prepare_task
+```
+
+### search index
+
+Search the knowledge base / indexed content using a query string:
+
+```python
+async for chunk in api.search_query(query="machine learning"):
+    print(chunk.get("content", ""), end="")
+```
+
+Each chunk contains keys: `type`, `content`, `message_id`, `seq_id`, `is_begin`, `is_end`, `is_think`.
+
+---
+
 ### cleanup
 
 > [!IMPORTANT]
