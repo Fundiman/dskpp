@@ -187,8 +187,11 @@ class DeepSeekAPI:
                 '/chat/create_pow_challenge',
                 {'target_path': '/api/v0/chat/completion'}
             )
-            return response['data']['biz_data']['challenge']
-        except KeyError:
+            biz_data = response['data']['biz_data']
+            if biz_data is None:
+                raise APIError(f"Empty biz_data in challenge response: {response.get('msg', '')}")
+            return biz_data['challenge']
+        except (KeyError, TypeError):
             raise APIError("Invalid challenge response format from server")
 
     async def _get_pow_challenge_for_upload(self) -> Dict[str, Any]:
@@ -199,8 +202,11 @@ class DeepSeekAPI:
                 '/chat/create_pow_challenge',
                 {'target_path': '/api/v0/file/upload_file'}
             )
-            return response['data']['biz_data']['challenge']
-        except KeyError:
+            biz_data = response['data']['biz_data']
+            if biz_data is None:
+                raise APIError(f"Empty biz_data in challenge response: {response.get('msg', '')}")
+            return biz_data['challenge']
+        except (KeyError, TypeError):
             raise APIError("Invalid challenge response format from server")
 
     async def create_chat_session(self) -> str:
@@ -211,8 +217,11 @@ class DeepSeekAPI:
                 '/chat_session/create',
                 {'character_id': None}
             )
-            return response['data']['biz_data']['id']
-        except KeyError:
+            biz_data = response['data']['biz_data']
+            if biz_data is None:
+                raise APIError(f"Failed to create session: {response.get('msg', '')}")
+            return biz_data['id']
+        except (KeyError, TypeError):
             raise APIError("Invalid session creation response format from server")
 
     async def delete_chat_session(self, chat_session_id: str) -> str:
@@ -288,7 +297,10 @@ class DeepSeekAPI:
                     raise APIError(text, response.status_code)
                 
                 result = json.loads(text)
-                return result['data']['biz_data']['id']
+                biz_data = result['data']['biz_data']
+                if biz_data is None:
+                    raise APIError(f"Empty biz_data in upload response: {result.get('msg', '')}")
+                return biz_data['id']
                     
             except Exception as e:
                 if retry_count >= max_retries - 1:
@@ -391,6 +403,120 @@ class DeepSeekAPI:
                 if not line or not line.strip():
                     continue
                 
+                parsed = self._parse_chunk_sync(line)
+                if parsed:
+                    if parsed.get('type') == 'message_ids':
+                        self.last_message_id[chat_session_id] = parsed['response_message_id']
+                        continue
+
+                    yield parsed
+
+                    if parsed.get('finish_reason') == 'stop':
+                        break
+
+    async def continue_stream(
+        self,
+        chat_session_id: str,
+        message_id: Optional[int] = None,
+        fallback_to_resume: bool = True,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Continue a stopped/incomplete stream generation
+
+        Args:
+            chat_session_id (str): The ID of the chat session
+            message_id (Optional[int]): The response message ID to continue.
+                If not provided, uses the last known response_message_id
+                tracked from the most recent chat_completion call.
+            fallback_to_resume (bool): Whether to fall back to resume if
+                the original generation context is no longer available.
+
+        Returns:
+            AsyncGenerator[Dict[str, Any], None]: Yields the same chunk format
+            as chat_completion, starting with the accumulated response text
+            followed by incremental content.
+        """
+        if not chat_session_id or not isinstance(chat_session_id, str):
+            raise ValueError("Chat session ID must be a non-empty string")
+
+        if message_id is None:
+            message_id = self.last_message_id.get(chat_session_id)
+        if message_id is None:
+            raise ValueError(
+                "message_id is required when no stream is tracked for this session"
+            )
+
+        json_data = {
+            'chat_session_id': chat_session_id,
+            'message_id': message_id,
+            'fallback_to_resume': fallback_to_resume,
+        }
+
+        headers = self._get_headers()
+
+        async with self.session.stream(
+            'POST',
+            f"{self.BASE_URL}/chat/continue",
+            headers=headers,
+            json=json_data,
+            cookies=self.cookies,
+            impersonate='chrome120',
+        ) as response:
+
+            if response.status_code != 200:
+                text = response.text
+                if response.status_code == 401:
+                    raise AuthenticationError("Invalid or expired authentication token")
+                elif response.status_code == 429:
+                    raise RateLimitError("API rate limit exceeded")
+                else:
+                    raise APIError(text, response.status_code)
+
+            async for line in response.aiter_lines():
+                if isinstance(line, bytes):
+                    line = line.decode('utf-8')
+                if not line or not line.strip():
+                    continue
+                if not line.startswith('data:') and not line.startswith('data: '):
+                    continue
+
+                data_str = line[6:] if line.startswith('data: ') else line[5:]
+                if not data_str or not data_str.strip():
+                    continue
+
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                # Handle message IDs
+                if 'request_message_id' in data and 'response_message_id' in data:
+                    self.last_message_id[chat_session_id] = data['response_message_id']
+                    yield {
+                        'type': 'message_ids',
+                        'response_message_id': data['response_message_id'],
+                        'finish_reason': None,
+                        'content': '',
+                    }
+                    continue
+
+                # Skip timestamp updates
+                if 'updated_at' in data:
+                    continue
+
+                # Handle v.response — full accumulated response state
+                v_val = data.get('v')
+                if isinstance(v_val, dict) and 'response' in v_val:
+                    fragments = v_val['response'].get('fragments', [])
+                    if fragments:
+                        yield {
+                            'type': 'text',
+                            'content': fragments[0].get('content', ''),
+                            'finish_reason': None,
+                        }
+                    continue
+
+                # Delegate remaining chunks to the standard parser
                 parsed = self._parse_chunk_sync(line)
                 if parsed:
                     if parsed.get('type') == 'message_ids':

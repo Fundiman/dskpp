@@ -253,6 +253,33 @@ response = await api.stop_stream(
 
 ---
 
+### continue stream generation
+
+Resume a stopped stream. The `message_id` is automatically tracked from the last `chat_completion` call:
+
+```python
+async for chunk in api.continue_stream(chat_session_id=session_id):
+    print(chunk.get("content", ""), end="", flush=True)
+```
+
+The first yielded chunk contains the full text generated before the stop, followed by incremental content as generation continues. Works the same as `chat_completion` — same chunk format, same finish signal.
+
+A specific `message_id` can also be passed:
+
+```python
+async for chunk in api.continue_stream(
+    chat_session_id=session_id,
+    message_id=2,
+    fallback_to_resume=True,
+):
+    print(chunk.get("content", ""), end="", flush=True)
+```
+
+> [!NOTE]
+> `fallback_to_resume` (default `True`) allows the API to fall back to a resume mechanism if the original generation context is lost.
+
+---
+
 ### cleanup
 
 > [!IMPORTANT]
