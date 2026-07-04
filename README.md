@@ -229,6 +229,81 @@ print(history)
 
 ---
 
+### stop stream generation
+
+Stop an active response mid-generation. The `message_id` is automatically tracked from the last `chat_completion` call:
+
+```python
+response = await api.stop_stream(chat_session_id=session_id)
+print(response)
+# {"code": 0, "msg": "", "data": {"biz_code": 0, "biz_msg": "", "biz_data": None}}
+```
+
+A specific `message_id` can also be passed directly:
+
+```python
+response = await api.stop_stream(
+    chat_session_id=session_id,
+    message_id=2  # response message ID
+)
+```
+
+> [!NOTE]
+> After `chat_completion` yields a chunk with `type: 'message_ids'`, its `response_message_id` is automatically stored and used by `stop_stream` when no `message_id` is given.
+
+---
+
+### continue stream generation
+
+Resume a stopped stream. The `message_id` is automatically tracked from the last `chat_completion` call:
+
+```python
+async for chunk in api.continue_stream(chat_session_id=session_id):
+    print(chunk.get("content", ""), end="", flush=True)
+```
+
+The first yielded chunk contains the full text generated before the stop, followed by incremental content as generation continues. Works the same as `chat_completion` — same chunk format, same finish signal.
+
+A specific `message_id` can also be passed:
+
+```python
+async for chunk in api.continue_stream(
+    chat_session_id=session_id,
+    message_id=2,
+    fallback_to_resume=True,
+):
+    print(chunk.get("content", ""), end="", flush=True)
+```
+
+> [!NOTE]
+> `fallback_to_resume` (default `True`) allows the API to fall back to a resume mechanism if the original generation context is lost.
+
+---
+
+### index prepare (handshake)
+
+Initialize the session environment before making other calls. Can be parallelized with other startup tasks:
+
+```python
+# Run concurrently with session creation to hide latency
+prepare_task = asyncio.create_task(api.index_prepare())
+session_id = await api.create_chat_session()
+prepare_result = await prepare_task
+```
+
+### search index
+
+Search the knowledge base / indexed content using a query string:
+
+```python
+async for chunk in api.search_query(query="machine learning"):
+    print(chunk.get("content", ""), end="")
+```
+
+Each chunk contains keys: `type`, `content`, `message_id`, `seq_id`, `is_begin`, `is_end`, `is_think`.
+
+---
+
 ### cleanup
 
 > [!IMPORTANT]
