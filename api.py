@@ -730,6 +730,73 @@ class DeepSeekAPI:
 
         return json.loads(response.text)
 
+    async def list_conversations(
+        self,
+        pinned: bool = False,
+        cursor: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch list of chat sessions/conversations.
+
+        Args:
+            pinned: Filter by pinned status (default False).
+            cursor: Optional pagination cursor value (e.g. a seq_id) for
+                    fetching the next page.
+
+        Returns:
+            List of chat session objects.
+        """
+        params = f"lte_cursor.pinned={str(pinned).lower()}"
+        if cursor is not None:
+            params += f"&lte_cursor.value={cursor}"
+        url = f"{self.BASE_URL}/chat_session/fetch_page?{params}"
+
+        headers = self._get_headers()
+        headers['x-client-bundle-id'] = 'com.deepseek.chat'
+        headers['x-client-locale'] = 'en_US'
+        headers['x-client-platform'] = 'web'
+        headers['x-client-timezone-offset'] = '18000'
+        headers['x-client-version'] = '2.2.0'
+
+        retry_count = 0
+        max_retries = 2
+
+        while retry_count < max_retries:
+            try:
+                response = await self.session.get(
+                    url,
+                    headers=headers,
+                    cookies=self.cookies,
+                    impersonate='chrome120',
+                )
+
+                text = response.text
+
+                if "<!DOCTYPE html>" in text and "Just a moment" in text:
+                    print("\033[93mWarning: Cloudflare detected\033[0m", file=sys.stderr)
+                    await self._refresh_cookies()
+                    retry_count += 1
+                    continue
+
+                if response.status_code == 401:
+                    raise AuthenticationError("Invalid or expired authentication token")
+                elif response.status_code == 429:
+                    raise RateLimitError("API rate limit exceeded")
+                elif response.status_code >= 500:
+                    raise APIError(text, response.status_code)
+                elif response.status_code != 200:
+                    raise APIError(text, response.status_code)
+
+                result = json.loads(text)
+                return result.get('data', {}).get('biz_data', {}).get('chat_sessions', [])
+
+            except Exception as e:
+                if retry_count >= max_retries - 1:
+                    raise NetworkError(str(e))
+                retry_count += 1
+
+        raise APIError("Failed to fetch conversations after retries")
+
     async def get_history(self, convo_id: str) -> Dict[str, Any]:
         """Fetch full conversation history"""
         url = f"{self.BASE_URL}/chat/history_messages?chat_session_id={convo_id}"

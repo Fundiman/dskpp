@@ -220,6 +220,23 @@ async for chunk in api.chat_completion(
 
 ---
 
+### list conversations
+
+```python
+sessions = await api.list_conversations()
+for s in sessions:
+    print(s['title'], s['id'], s['current_message_id'])
+```
+
+Each session object contains: `id`, `title`, `updated_at`, `pinned`, `current_message_id`, `seq_id`, `inserted_at`, `model_type`, `agent`, `version`.
+
+Paginate by passing the last session's `seq_id` as cursor:
+```python
+next_page = await api.list_conversations(cursor=str(sessions[-1]['seq_id']))
+```
+
+---
+
 ### conversation history
 
 ```python
