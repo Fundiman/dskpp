@@ -220,10 +220,10 @@ class DeepSeekAPI:
                 '/chat_session/create',
                 {'character_id': None}
             )
-            biz_data = response['data']['biz_data']
-            if biz_data is None:
+            chat_session = response['data']['biz_data']['chat_session']
+            if chat_session is None:
                 raise APIError(f"Failed to create session: {response.get('msg', '')}")
-            return biz_data['id']
+            return chat_session['id']
         except (KeyError, TypeError):
             raise APIError("Invalid session creation response format from server")
 
