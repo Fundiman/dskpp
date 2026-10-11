@@ -15,7 +15,7 @@ This project follows the same conceptual direction (and also contains elements f
 > This project is built around reverse-engineered infrastructure behavior. Use responsibly and be aware that API changes may break functionality without notice.
 
 > [!IMPORTANT]
-> Cookie generation is required before using the API client. Run `python run_and_get_cookies.py` first — the client will not work without valid cookies.
+> Follow the quick-start steps below for cookie acquisition. The client loads cookies from `dsk/cookies.json` inside this repository, or uses an empty cookie dictionary if that file is absent or invalid.
 
 ---
 
@@ -38,12 +38,14 @@ dsk++ provides:
 
 ### clone repo
 
-> [!CAUTION]
-> Do not cd (change directory) into it, you'll import it like dskpp.api!
-
 ```bash
 git clone https://github.com/fundiman/dskpp
+cd dskpp
 ```
+
+Run installation and cookie setup commands from the repository directory.
+Run application scripts that import `dskpp.api` from its parent directory,
+or put that parent directory on `PYTHONPATH`.
 
 ### install dependencies
 
@@ -56,22 +58,23 @@ pip install -r requirements.txt
 
 **System dependencies (Linux / server environments):**
 
-* google-chrome or chromium
-* xvfb (for headless fallback)
+* Google Chrome at `/usr/bin/google-chrome` (change `browser_path` in `server.py` to use Chromium or another location)
+* xvfb (when using `--headless` or `DOCKERMODE=true`)
 * python 3.10+
 
 > [!TIP]
-> Chrome and xvfb are only used for Cloudflare clearance during cookie generation. In normal usage you acquire cookies once and they last for days — you'll only need these if you're spamming requests aggressively enough to trigger Cloudflare challenges. These dependencies are NOT used for general interaction with DeepSeek - all requests beyond cookie generation are automated with curl_cffi!
+> Browser automation is used for cookie acquisition and refresh. Normal API requests use `curl_cffi`. Cookie lifetime depends on the server and browser environment; refresh them when necessary.
 
 ---
 
 ## quick start
 
 > [!IMPORTANT]
-> Before using the API client, cookies must be generated:
+> Run these commands from the repository directory to generate cookies and place them where the client reads them:
 
 ```bash
 python run_and_get_cookies.py
+cp dsk/dsk/cookies.json dsk/cookies.json
 ```
 
 This will:
@@ -79,7 +82,13 @@ This will:
 * start local bypass server
 * launch Chromium automation
 * solve Cloudflare challenges
-* store cookies in `dsk/dsk/cookies.json`
+* store cookies in `dsk/dsk/cookies.json` relative to the working directory; the copy command places them in the client's `dsk/cookies.json`
+
+The bootstrap script leaves the bypass server running in the background.
+The automatic refresh helper (`bypass.py`) also writes to the working-directory
+path `dsk/dsk/cookies.json`, while the client reloads the repository-relative
+`dsk/cookies.json`. These paths currently differ, so a refresh does not
+automatically replace the client's cookie file.
 
 > [!NOTE]
 > The bypass server runs locally on port 8021 by default. Ensure this port is available.
@@ -148,12 +157,12 @@ file_ids = await api.upload_files([
     "data.csv"
 ])
 
-# file_ids returned in same order as input
+# Successful file IDs retain input order; failed/timed-out IDs are omitted
 print(file_ids)  # ['file_id_1', 'file_id_2', 'file_id_3']
 ```
 
 > [!NOTE]
-> The system uploads all files simultaneously using `asyncio.gather()` for maximum efficiency.
+> Uploads run concurrently using `asyncio.gather()`. Each upload waits up to 60 seconds for processing, polling every 2 seconds. Processing failures/timeouts return an empty ID that is filtered out; request failures can raise an exception for the upload operation.
 
 ---
 
@@ -165,14 +174,21 @@ async for chunk in api.chat_completion(
     prompt="Analyze these uploaded files",
     ref_file_ids=file_ids,  # List of file IDs from upload
     thinking_enabled=True,
-    search_enabled=False  # Must be False when using files
+    search_enabled=True,  # Web search works together with file references
+    show_thinking=True   # Include reasoning chunks in the output
 ):
     # chunk is a dictionary with 'content' key
     print(chunk.get("content", ""), end="")
 ```
 
-> [!WARNING]
-> File uploads require `search_enabled=False`. Attempting to use both will raise `UploadFilesUnavailable`.
+File references, web search, and reasoning can all be enabled together.
+Model selection is automatic;
+the client no longer sends `model_type` or `x-model-type`.
+
+Pass `show_thinking=True` to `chat_completion` or `continue_stream` to receive
+reasoning as chunks with `type='thinking'`. By default, reasoning is omitted
+from the output; `thinking_enabled` controls whether the model reasons.
+Search citations are rendered as Markdown links when source URLs are available.
 
 ---
 
@@ -196,14 +212,14 @@ The client parses DeepSeek's SSE format and returns dictionaries:
 
 ```python
 {
-    'type': 'text',           # Type of chunk (text, message_ids, etc.)
+    'type': 'text',           # 'text', or 'thinking' when show_thinking=True
     'content': 'incremental text...',  # The actual content
     'finish_reason': None     # 'stop' when complete, None otherwise
 }
 ```
 
 > [!NOTE]
-> The parser automatically handles both full format (with 'p' and 'o' fields) and simplified format (just 'v' field) chunks.
+> The parser handles response snapshots, fragment appends, BATCH operations, and simplified string 'v' chunks. It filters out tool content. Unresolved citation markers are removed. `chat_completion` tracks message IDs internally rather than yielding them; `continue_stream` can also yield explicit `message_ids` events.
 
 ---
 
@@ -231,11 +247,14 @@ for s in sessions:
     print(s['title'], s['id'], s['current_message_id'])
 ```
 
-Each session object contains: `id`, `title`, `updated_at`, `pinned`, `current_message_id`, `seq_id`, `inserted_at`, `model_type`, `agent`, `version`.
+Session objects are returned as supplied by the server. Typical fields include
+`id`, `title`, `updated_at`, `pinned`, `current_message_id`, and `seq_id`;
+additional metadata may vary. Use `pinned=True` to request pinned sessions.
 
 Paginate by passing the last session's `seq_id` as cursor:
 ```python
-next_page = await api.list_conversations(cursor=str(sessions[-1]['seq_id']))
+if sessions:
+    next_page = await api.list_conversations(cursor=str(sessions[-1]['seq_id']))
 ```
 
 ---
@@ -269,7 +288,7 @@ response = await api.stop_stream(
 ```
 
 > [!NOTE]
-> After `chat_completion` yields a chunk with `type: 'message_ids'`, its `response_message_id` is automatically stored and used by `stop_stream` when no `message_id` is given.
+> `chat_completion` stores the `response_message_id` internally when it receives a message-ID event. `stop_stream` uses that ID when no explicit `message_id` is given, and raises `ValueError` if no ID is known.
 
 ---
 
@@ -282,7 +301,11 @@ async for chunk in api.continue_stream(chat_session_id=session_id):
     print(chunk.get("content", ""), end="", flush=True)
 ```
 
-The first yielded chunk contains the full text generated before the stop, followed by incremental content as generation continues. Works the same as `chat_completion` — same chunk format, same finish signal.
+When the server sends an accumulated snapshot, the client emits the active
+fragment's content, followed by incremental content as generation continues.
+This is not necessarily the full response across all fragments. Reasoning is
+included only with `show_thinking=True`. Text chunks and the finish signal use
+the same format as `chat_completion`.
 
 A specific `message_id` can also be passed:
 
@@ -302,7 +325,8 @@ async for chunk in api.continue_stream(
 
 ### index prepare (handshake)
 
-Initialize the session environment before making other calls. Can be parallelized with other startup tasks:
+Call the index preparation endpoint when needed. The client does not require
+this call before `chat_completion`. It can be parallelized with startup tasks:
 
 ```python
 # Run concurrently with session creation to hide latency
@@ -351,8 +375,12 @@ http://localhost:8021
 
 Endpoints:
 
-* `/cookies` → returns validated cookies + user-agent
-* `/html` → returns raw HTML + cookies header metadata
+* `/cookies?url=https://chat.deepseek.com` → returns browser cookies + user-agent (does not validate that `cf_clearance` is present)
+* `/html?url=https://chat.deepseek.com` → returns raw HTML with `cookies` and `user_agent` response headers
+
+Both endpoints require `url` and accept optional `retries` (default 5) and
+`proxy` parameters. `SERVER_PORT` overrides the manual server's port; the
+cookie helper scripts still connect to port 8021.
 
 ---
 
@@ -366,7 +394,7 @@ export DOCKERMODE=true
 
 This enables:
 
-* headless Chromium adjustments
+* an Xvfb virtual display for the headed Chromium process
 * sandbox flags
 * remote debugging port support
 
@@ -384,7 +412,7 @@ The system is composed of three core layers:
 Async client for session-based chat interaction with:
 - concurrent file uploads using asyncio.gather()
 - streaming response parsing for DeepSeek SSE format
-- automatic retry logic with Cloudflare detection and cookie refresh
+- retries and Cloudflare detection for regular JSON requests, uploads, and conversation listing; streaming requests do not automatically retry or refresh cookies
 - async session management with curl_cffi
 
 ### 2. bypass layer (`server.py`)
@@ -409,7 +437,7 @@ The system is designed around non-blocking execution:
 * streaming responses use async generators that yield control between chunks
 * blocking WASM computations are offloaded to threads via asyncio.to_thread()
 * browser automation runs in separate processes
-* cookie acquisition runs outside event loop control path
+* cookie acquisition uses async HTTP requests and a separate server process
 * concurrent file uploads using asyncio.gather()
 * colored warning outputs for better visibility
 
@@ -424,13 +452,17 @@ from dskpp.api import (
     AuthenticationError,    # Invalid/expired token
     RateLimitError,         # API rate limit exceeded
     NetworkError,           # Network communication failure
-    CloudflareError,        # Cloudflare block detected
-    UploadFilesUnavailable, # Search enabled during file upload
     APIError               # Generic API error with status code
 )
 ```
 
 ---
+
+`CloudflareError` and `UploadFilesUnavailable` remain defined for compatibility,
+but current request paths do not raise them. The retry wrappers in
+`_make_request`, file upload, and conversation listing can wrap authentication,
+rate-limit, or API errors in `NetworkError` after retries; streaming calls
+raise `AuthenticationError`, `RateLimitError`, or `APIError` directly.
 
 ## example: full flow with file upload
 
@@ -452,12 +484,14 @@ async def main():
     ])
     print(f"Uploaded files: {file_ids}")
 
-    # Chat with file context
+    # Chat with file context, web search, and reasoning
     async for chunk in api.chat_completion(
         session,
-        "Analyze these files and summarize key points",
+        "Analyze these files and verify key points using web search",
         ref_file_ids=file_ids,
-        search_enabled=False  # Required for file uploads
+        thinking_enabled=True,
+        search_enabled=True,
+        show_thinking=True
     ):
         print(chunk.get("content", ""), end="")
 
@@ -476,7 +510,7 @@ asyncio.run(main())
 > This project is experimental and based on reverse-engineered behavior of DeepSeek's infrastructure. DeepSeek may modify their API at any time, which could break this client — while efforts will be made to address issues, full compatibility cannot be guaranteed. Use of this client may also violate DeepSeek's terms of service and could result in account suspension or banning. Please use at your own risk.
 
 > [!TIP]
-> If you encounter Cloudflare blocks, try deleting `dsk/dsk/cookies.json` and re-running `python run_and_get_cookies.py` to refresh your cookies.
+> If you encounter Cloudflare blocks, regenerate cookies from the repository directory with `python run_and_get_cookies.py`, then copy `dsk/dsk/cookies.json` to `dsk/cookies.json`. Recreate the client to load the updated file.
 
 > [!NOTE]
 > The client automatically handles both SSE event lines and data lines, parsing the simplified chunk format (just 'v' field) that appears after the first response chunk.

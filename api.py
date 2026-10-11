@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any, AsyncGenerator, Literal, List
 import json
 from .pow import DeepSeekPOW
 import asyncio
+import re
 from pathlib import Path
 import sys
 import subprocess
@@ -50,9 +51,6 @@ class APIError(DeepSeekError):
 
 class DeepSeekAPI:
     BASE_URL = "https://chat.deepseek.com/api/v0"
-    MODEL_TYPE = 'default' # 'default' — supports files (only text data, images, and documents)
-                           # 'expert'  — does not support files (only prompts)
-                           # 'vision'  — supports files (any images and documents)
 
     def __init__(self, auth_token: str):
         if not auth_token or not isinstance(auth_token, str):
@@ -61,6 +59,7 @@ class DeepSeekAPI:
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
         self.last_message_id: Dict[str, Any] = {}
+        self._reset_stream_state()
 
         self.session = AsyncSession()
 
@@ -91,7 +90,7 @@ class DeepSeekAPI:
             'x-app-version': '20241129.1',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '2.0.0',
+            'x-client-version': '2.5.0',
         }
 
         if pow_response:
@@ -254,12 +253,11 @@ class DeepSeekAPI:
             'origin': 'https://chat.deepseek.com',
             'referer': 'https://chat.deepseek.com/',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-            'x-app-version': '2.0.0',
+            'x-app-version': '2.5.0',
             'x-client-locale': 'en_US',
             'x-client-platform': 'web',
-            'x-client-version': '2.0.0',
+            'x-client-version': '2.5.0',
             'x-ds-pow-response': pow_response,
-            'x-model-type': self.MODEL_TYPE
         }
         
         retry_count = 0
@@ -403,7 +401,8 @@ class DeepSeekAPI:
         parent_message_id: Optional[str] = None,
         ref_file_ids: Optional[List[str]] = None,
         thinking_enabled: bool = True,
-        search_enabled: bool = False
+        search_enabled: bool = False,
+        show_thinking: bool = False
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Send a message and get streaming response
@@ -415,6 +414,7 @@ class DeepSeekAPI:
             ref_file_ids (Optional[List[str]]): List of file IDs to reference
             thinking_enabled (bool): Whether to show the thinking process
             search_enabled (bool): Whether to enable web search for up-to-date information
+            show_thinking (bool): Whether to include thinking fragments in the output
             
         Returns:
             AsyncGenerator[Dict[str, Any], None]: Yields message chunks with content and type
@@ -424,8 +424,6 @@ class DeepSeekAPI:
             raise ValueError("Prompt must be a non-empty string")
         if not chat_session_id or not isinstance(chat_session_id, str):
             raise ValueError("Chat session ID must be a non-empty string")
-        if ref_file_ids and search_enabled:
-            raise UploadFilesUnavailable("To use file uploads, you need to turn off the search.")
 
         json_data = {
             'chat_session_id': chat_session_id,
@@ -434,7 +432,6 @@ class DeepSeekAPI:
             'ref_file_ids': ref_file_ids if ref_file_ids else [],
             'thinking_enabled': thinking_enabled,
             'search_enabled': search_enabled,
-            'model_type': self.MODEL_TYPE,
             'preempt': False,
             'action': None
         }
@@ -444,6 +441,8 @@ class DeepSeekAPI:
         pow_response = await self.pow_solver.solve_challenge(challenge)
 
         headers = self._get_headers(pow_response)
+
+        self._reset_stream_state(show_thinking)
 
         # Use async with for stream
         async with self.session.stream(
@@ -473,7 +472,7 @@ class DeepSeekAPI:
                 # Skip empty lines
                 if not line or not line.strip():
                     continue
-                
+
                 parsed = self._parse_chunk_sync(line)
                 if parsed:
                     if parsed.get('type') == 'message_ids':
@@ -564,6 +563,7 @@ class DeepSeekAPI:
         chat_session_id: str,
         message_id: Optional[int] = None,
         fallback_to_resume: bool = True,
+        show_thinking: bool = False,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """
         Continue a stopped/incomplete stream generation
@@ -575,6 +575,7 @@ class DeepSeekAPI:
                 tracked from the most recent chat_completion call.
             fallback_to_resume (bool): Whether to fall back to resume if
                 the original generation context is no longer available.
+            show_thinking (bool): Whether to include thinking fragments in the output
 
         Returns:
             AsyncGenerator[Dict[str, Any], None]: Yields the same chunk format
@@ -590,6 +591,8 @@ class DeepSeekAPI:
             raise ValueError(
                 "message_id is required when no stream is tracked for this session"
             )
+
+        self._reset_stream_state(show_thinking)
 
         json_data = {
             'chat_session_id': chat_session_id,
@@ -653,12 +656,11 @@ class DeepSeekAPI:
                 v_val = data.get('v')
                 if isinstance(v_val, dict) and 'response' in v_val:
                     fragments = v_val['response'].get('fragments', [])
-                    if fragments:
-                        yield {
-                            'type': 'text',
-                            'content': fragments[0].get('content', ''),
-                            'finish_reason': None,
-                        }
+                    self._update_references(v_val['response'].get('references'))
+                    self._sync_fragment_tracking(fragments)
+                    emitted = self._emit_active_fragment(fragments)
+                    if emitted is not None:
+                        yield emitted
                     continue
 
                 # Delegate remaining chunks to the standard parser
@@ -821,6 +823,127 @@ class DeepSeekAPI:
 
         return json.loads(response.text)
 
+    def _reset_stream_state(self, show_thinking: bool = False) -> None:
+        self._fragment_types: Dict[Any, str] = {}
+        self._active_fragment_id: Any = None
+        self._current_fragment_type = 'RESPONSE'
+        self._show_thinking = show_thinking
+        self._reference_map: Dict[int, Dict[str, Any]] = {}
+        self._search_results: List[Dict[str, Any]] = []
+        self._marker_to_ref_id: Dict[int, int] = {}
+        self._marker_ref_type: Dict[int, str] = {}
+        self._tool_fragments: Dict[int, Dict[str, Any]] = {}
+
+    def _extract_batch_content(self, ops: Any) -> Optional[str]:
+        """Extract textual content from relative BATCH operations."""
+        if not isinstance(ops, list):
+            return None
+        parts = [op['v'] for op in ops if isinstance(op, dict)
+                 and op.get('p') == 'content'
+                 and isinstance(op.get('v'), str) and op['v'].strip()]
+        return ''.join(parts) if parts else None
+
+    def _sync_fragment_tracking(self, fragments: Any) -> None:
+        """Track types and select the last non-empty or last created fragment."""
+        if not isinstance(fragments, list) or not fragments:
+            return
+        last_non_empty = None
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                continue
+            if fragment.get('id') is not None:
+                self._fragment_types[fragment['id']] = fragment.get('type', 'RESPONSE')
+                self._update_references(fragment.get('references'))
+                self._register_tool_fragment(fragment)
+            if fragment.get('content'):
+                last_non_empty = fragment.get('id')
+        last_created = fragments[-1].get('id') if isinstance(fragments[-1], dict) else None
+        active_id = last_non_empty if last_non_empty is not None else last_created
+        if active_id is not None:
+            self._sync_content_fragment(active_id)
+
+    def _update_references(self, refs: Any) -> None:
+        if not isinstance(refs, list):
+            return
+        for ref in refs:
+            if isinstance(ref, dict) and ref.get('id') is not None:
+                self._reference_map.setdefault(ref['id'], {}).update(ref)
+
+    def _register_tool_fragment(self, fragment: Dict[str, Any]) -> None:
+        if fragment.get('type') in ('TOOL_OPEN', 'TOOL_SEARCH') and fragment.get('id') is not None:
+            self._tool_fragments[fragment['id']] = fragment
+
+    def _map_markers_to_refs(self, content: str, refs: List[Dict[str, Any]]) -> None:
+        markers = [int(marker) for marker in re.findall(r'\[reference:(\d+)\]', content)]
+        for marker, ref in zip(markers, refs):
+            if ref.get('id') is not None:
+                self._marker_to_ref_id[marker] = ref['id']
+                self._marker_ref_type[marker] = ref.get('type', '')
+
+    def _clean_references(self, content: str) -> str:
+        """Replace reference markers with Markdown citations, dropping unresolved ones."""
+        if not content or '[reference:' not in content:
+            return content
+
+        def repl(match):
+            marker = int(match.group(1))
+            rid = self._marker_to_ref_id.get(marker)
+            link = None
+            if rid is not None:
+                ref = self._reference_map.get(rid)
+                if ref and ref.get('url'):
+                    link = ref['url']
+                elif self._marker_ref_type.get(marker) == 'TOOL_OPEN' and rid in self._tool_fragments:
+                    result = self._tool_fragments[rid].get('result') or {}
+                    link = result.get('url')
+            if not link:
+                return ''
+            rendered = f'[[{marker}]]({link})'
+            if match.start() > 0 and content[match.start() - 1] not in ' \t\n\r':
+                rendered = ' ' + rendered
+            return rendered
+
+        return re.sub(r'\[reference:(\d+)\]', repl, content)
+
+    def _update_search_results(self, results: Any, op: Optional[str] = None) -> None:
+        if isinstance(results, list):
+            self._search_results.extend(results)
+
+    def _sync_content_fragment(self, fragment_id: Any) -> None:
+        if fragment_id is not None:
+            self._active_fragment_id = fragment_id
+            if fragment_id in self._fragment_types:
+                self._current_fragment_type = self._fragment_types[fragment_id]
+
+    def _current_type(self) -> str:
+        return self._fragment_types.get(self._active_fragment_id, self._current_fragment_type)
+
+    def _content_chunk(self, content: Any, fragment_type: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(content, str) or fragment_type not in ('RESPONSE', 'THINK'):
+            return None
+        if fragment_type == 'THINK' and not self._show_thinking:
+            return None
+        return {
+            'type': 'thinking' if fragment_type == 'THINK' else 'text',
+            'content': self._clean_references(content),
+            'finish_reason': None,
+        }
+
+    def _emit_active_fragment(self, fragments: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(fragments, list):
+            return None
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                continue
+            if self._active_fragment_id is not None and fragment.get('id') != self._active_fragment_id:
+                continue
+            content = fragment.get('content')
+            if not isinstance(content, str) or not content.strip():
+                return None
+            emitted = self._content_chunk(content, fragment.get('type', 'RESPONSE'))
+            return emitted if emitted and emitted['content'] else None
+        return None
+
     def _parse_chunk_sync(self, chunk: str) -> Optional[Dict[str, Any]]:
         """Parse a SSE chunk from the API response (synchronous version)"""
         if not chunk:
@@ -848,16 +971,11 @@ class DeepSeekAPI:
                 response_data = data['v']['response']
                 fragments = response_data.get('fragments', [])
 
-                # Extract text from RESPONSE type fragments
-                for fragment in fragments:
-                    if fragment.get('type') == 'RESPONSE' and fragment.get('content'):
-                        content = fragment['content']
-                        if isinstance(content, str) and content.strip():
-                            return {
-                                'type': 'text',
-                                'content': content,
-                                'finish_reason': None
-                            }
+                self._update_references(response_data.get('references'))
+                self._sync_fragment_tracking(fragments)
+                emitted = self._emit_active_fragment(fragments)
+                if emitted is not None:
+                    return emitted
 
                 # Check for message IDs in the response structure
                 if 'message_id' in response_data:
@@ -868,25 +986,60 @@ class DeepSeekAPI:
                         'content': ''
                     }
 
-            # Handle chunks with just 'v' field (simplified format)
-            if 'v' in data and 'p' not in data and not isinstance(data['v'], dict):
-                v_value = data.get('v', '')
-                return {
-                    'type': 'text',
-                    'content': str(v_value),
-                    'finish_reason': None
-                }
+            # Newly appended fragments become active, even when initially empty.
+            if data.get('p') == 'response/fragments' and data.get('o') == 'APPEND':
+                fragments = data.get('v', [])
+                if isinstance(fragments, list) and fragments:
+                    self._sync_fragment_tracking(fragments)
+                    fragment = fragments[-1]
+                    if not isinstance(fragment, dict):
+                        return None
+                    self._sync_content_fragment(fragment.get('id'))
+                    content = fragment.get('content') or ''
+                    if isinstance(content, str) and content.strip():
+                        return self._content_chunk(content, fragment.get('type', 'RESPONSE'))
+                return None
 
-            # Handle full DeepSeek format with 'p' and 'v' fields
-            if 'v' in data and data.get('p') == 'response/fragments/-1/content' and data.get('o') == 'APPEND':
-                v_value = data.get('v', '')
-                if isinstance(v_value, dict):
+            if 'v' in data and 'p' not in data and isinstance(data['v'], str):
+                return self._content_chunk(data['v'], self._current_type())
+
+            # BATCH events carry content and citation metadata together.
+            if data.get('o') == 'BATCH' and isinstance(data.get('v'), list):
+                ref_objs: List[Dict[str, Any]] = []
+                for op in data['v']:
+                    if not isinstance(op, dict):
+                        continue
+                    if op.get('p') == 'references' and isinstance(op.get('v'), list):
+                        self._update_references(op['v'])
+                        ref_objs.extend(ref for ref in op['v']
+                                        if isinstance(ref, dict) and ref.get('id') is not None)
+                    elif op.get('p') == 'results':
+                        self._update_search_results(op.get('v'), op.get('o'))
+                    elif op.get('p') == 'fragments' and isinstance(op.get('v'), list):
+                        for fragment in op['v']:
+                            if isinstance(fragment, dict):
+                                self._register_tool_fragment(fragment)
+                content = self._extract_batch_content(data['v']) or ''
+                self._map_markers_to_refs(content, ref_objs)
+                content = self._clean_references(content)
+                if not content:
                     return None
-                return {
-                    'type': 'text',
-                    'content': str(v_value),
-                    'finish_reason': None
-                }
+                return self._content_chunk(content, self._current_type())
+
+            path = data.get('p', '')
+            if re.match(r'^response/fragments/(-?\d+)/references$', path):
+                self._update_references(data.get('v'))
+                return None
+            if re.match(r'^response/fragments/(-?\d+)/results$', path):
+                self._update_search_results(data.get('v'), data.get('o'))
+                return None
+
+            content_match = re.match(r'^response/fragments/(-?\d+)/content$', path)
+            if content_match and 'v' in data:
+                fragment_id = content_match.group(1)
+                if fragment_id != '-1':
+                    self._sync_content_fragment(int(fragment_id))
+                return self._content_chunk(data['v'], self._current_type())
 
             # Handle finished status
             if data.get('p') == 'response/status' and data.get('v') == 'FINISHED':
@@ -913,7 +1066,8 @@ class DeepSeekAPI:
         except Exception as e:
             print(f"Warning: Error parsing chunk: {e}", file=sys.stderr)
             return None
-            
+
+
     async def close(self):
         """Close the async session"""
         await self.session.close()
