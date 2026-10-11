@@ -824,6 +824,8 @@ class DeepSeekAPI:
         return json.loads(response.text)
 
     def _reset_stream_state(self, show_thinking: bool = False) -> None:
+        """Reset fragment and reference tracking before starting a stream"""
+        # Fragment IDs and citation markers belong to the current stream
         self._fragment_types: Dict[Any, str] = {}
         self._active_fragment_id: Any = None
         self._current_fragment_type = 'RESPONSE'
@@ -844,7 +846,11 @@ class DeepSeekAPI:
         return ''.join(parts) if parts else None
 
     def _sync_fragment_tracking(self, fragments: Any) -> None:
-        """Track types and select the last non-empty or last created fragment."""
+        """
+        Update fragment types and select the active fragment from a snapshot.
+        Snapshots may already contain empty fragments for future output, so
+        prefer the last fragment with content over the last created fragment.
+        """
         if not isinstance(fragments, list) or not fragments:
             return
         last_non_empty = None
@@ -863,17 +869,24 @@ class DeepSeekAPI:
             self._sync_content_fragment(active_id)
 
     def _update_references(self, refs: Any) -> None:
+        """Accumulate reference metadata keyed by reference ID"""
         if not isinstance(refs, list):
             return
         for ref in refs:
             if isinstance(ref, dict) and ref.get('id') is not None:
+                # Later events may add fields to an existing reference
                 self._reference_map.setdefault(ref['id'], {}).update(ref)
 
     def _register_tool_fragment(self, fragment: Dict[str, Any]) -> None:
+        """Remember search and opened-page fragments for citation resolution"""
         if fragment.get('type') in ('TOOL_OPEN', 'TOOL_SEARCH') and fragment.get('id') is not None:
             self._tool_fragments[fragment['id']] = fragment
 
     def _map_markers_to_refs(self, content: str, refs: List[Dict[str, Any]]) -> None:
+        """
+        Map citation markers to references carried by the same BATCH event.
+        Marker numbers are citation counters, not tool fragment IDs.
+        """
         markers = [int(marker) for marker in re.findall(r'\[reference:(\d+)\]', content)]
         for marker, ref in zip(markers, refs):
             if ref.get('id') is not None:
@@ -890,35 +903,44 @@ class DeepSeekAPI:
             rid = self._marker_to_ref_id.get(marker)
             link = None
             if rid is not None:
+                # Prefer an explicit URL supplied by the reference metadata
                 ref = self._reference_map.get(rid)
                 if ref and ref.get('url'):
                     link = ref['url']
                 elif self._marker_ref_type.get(marker) == 'TOOL_OPEN' and rid in self._tool_fragments:
+                    # Opened-page fragments store the source URL in their result
                     result = self._tool_fragments[rid].get('result') or {}
                     link = result.get('url')
             if not link:
+                # Do not expose internal markers when the source is unknown
                 return ''
             rendered = f'[[{marker}]]({link})'
             if match.start() > 0 and content[match.start() - 1] not in ' \t\n\r':
+                # Separate the rendered citation from the preceding text
                 rendered = ' ' + rendered
             return rendered
 
         return re.sub(r'\[reference:(\d+)\]', repl, content)
 
     def _update_search_results(self, results: Any, op: Optional[str] = None) -> None:
+        """Accumulate search results across query result sets"""
+        # Keep earlier results even when a later event contains another result set
         if isinstance(results, list):
             self._search_results.extend(results)
 
     def _sync_content_fragment(self, fragment_id: Any) -> None:
+        """Mark the fragment receiving incremental content as active"""
         if fragment_id is not None:
             self._active_fragment_id = fragment_id
             if fragment_id in self._fragment_types:
                 self._current_fragment_type = self._fragment_types[fragment_id]
 
     def _current_type(self) -> str:
+        """Return the active fragment type, falling back to the last known type"""
         return self._fragment_types.get(self._active_fragment_id, self._current_fragment_type)
 
     def _content_chunk(self, content: Any, fragment_type: str) -> Optional[Dict[str, Any]]:
+        """Build a text or thinking chunk, skipping tool content and hidden reasoning"""
         if not isinstance(content, str) or fragment_type not in ('RESPONSE', 'THINK'):
             return None
         if fragment_type == 'THINK' and not self._show_thinking:
@@ -930,6 +952,7 @@ class DeepSeekAPI:
         }
 
     def _emit_active_fragment(self, fragments: Any) -> Optional[Dict[str, Any]]:
+        """Extract visible content from the active fragment in a response snapshot"""
         if not isinstance(fragments, list):
             return None
         for fragment in fragments:
@@ -966,7 +989,7 @@ class DeepSeekAPI:
             # Parse JSON
             data = json.loads(data_str)
 
-            # Handle nested response format (first message with full structure)
+            # Handle nested response format (accumulated snapshot with full structure)
             if 'v' in data and isinstance(data['v'], dict) and 'response' in data['v']:
                 response_data = data['v']['response']
                 fragments = response_data.get('fragments', [])
@@ -1000,6 +1023,7 @@ class DeepSeekAPI:
                         return self._content_chunk(content, fragment.get('type', 'RESPONSE'))
                 return None
 
+            # Simplified chunks inherit the active fragment's type
             if 'v' in data and 'p' not in data and isinstance(data['v'], str):
                 return self._content_chunk(data['v'], self._current_type())
 
@@ -1026,6 +1050,7 @@ class DeepSeekAPI:
                     return None
                 return self._content_chunk(content, self._current_type())
 
+            # Handle reference and search metadata separately from visible content
             path = data.get('p', '')
             if re.match(r'^response/fragments/(-?\d+)/references$', path):
                 self._update_references(data.get('v'))
@@ -1034,6 +1059,7 @@ class DeepSeekAPI:
                 self._update_search_results(data.get('v'), data.get('o'))
                 return None
 
+            # Explicit fragment IDs switch the active type; -1 keeps the current one
             content_match = re.match(r'^response/fragments/(-?\d+)/content$', path)
             if content_match and 'v' in data:
                 fragment_id = content_match.group(1)
