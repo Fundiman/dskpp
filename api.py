@@ -1009,6 +1009,14 @@ class DeepSeekAPI:
                         'content': ''
                     }
 
+            # Replacement snapshots can switch from THINK to RESPONSE without APPEND.
+            if data.get('p') == 'response/fragments' and data.get('o', 'SET') == 'SET':
+                fragments = data.get('v')
+                if isinstance(fragments, list):
+                    self._sync_fragment_tracking(fragments)
+                    return self._emit_active_fragment(fragments)
+                return None
+
             # Newly appended fragments become active, even when initially empty.
             if data.get('p') == 'response/fragments' and data.get('o') == 'APPEND':
                 fragments = data.get('v', [])
